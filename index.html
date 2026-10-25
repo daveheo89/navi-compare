@@ -66,6 +66,26 @@ button:focus-visible, a:focus-visible{outline:3px solid var(--center); outline-o
 #status{margin:14px 2px 0; color:var(--muted); min-height:1.5em}
 #status.err{color:var(--err); font-weight:500}
 
+/* 확정한 주소, 후보 목록 */
+.row.has-btn{grid-template-columns:2.6em 1fr auto}
+.row.has-btn .picked{grid-column:2 / -1}
+#locate{font:inherit; font-weight:700; font-size:.9rem; color:var(--sign-ink); background:transparent; border:2px solid var(--sign-edge); border-radius:6px; min-height:40px; padding:0 10px; cursor:pointer}
+#locate:disabled{opacity:.6; cursor:wait}
+.row .picked{grid-column:2; font-size:.82rem; line-height:1.35; color:var(--sign-edge); margin:2px 2px 0}
+.sugg{margin-top:12px; background:var(--surface); border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.sugg-title{margin:0; padding:10px 12px; font-size:.85rem; color:var(--muted)}
+.cand, .fav button.cand{
+  display:block; width:100%; min-height:0; text-align:left; font:inherit; font-size:.95rem; font-weight:400;
+  padding:10px 12px; border:0; border-top:1px solid var(--line); border-radius:0;
+  background:transparent; color:var(--ink); cursor:pointer;
+}
+.cand b{font-weight:700}
+.cand .cat{margin-left:6px; font-size:.75rem; color:var(--muted)}
+.cand small{display:block; margin-top:2px; font-size:.82rem; color:var(--muted)}
+.cand:active, .fav button.cand:active{background:var(--bg)}
+.fav-picked{font-size:.82rem; color:var(--best)}
+.fav-cands{border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface)}
+
 /* 자주 가는 곳 */
 .fav{margin-top:14px; background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:2px 12px}
 .fav summary{cursor:pointer; padding:12px 0; font-weight:700; font-size:.95rem; list-style:none; display:flex; justify-content:space-between; align-items:center}
@@ -135,13 +155,15 @@ td.best{color:var(--best); font-weight:700}
   <form id="f" class="sign" autocomplete="off">
     <div class="sign-inner">
       <div>
-        <div class="row"><label for="from">출발</label><input id="from" name="from" placeholder="주소나 장소 이름" enterkeyhint="next"></div>
-        <div class="row"><label for="to">도착</label><input id="to" name="to" placeholder="주소나 장소 이름" enterkeyhint="go"></div>
+        <div class="row has-btn"><label for="from">출발</label><input id="from" name="from" placeholder="주소나 장소 이름" enterkeyhint="next"><button type="button" id="locate" aria-label="현재 위치를 출발지로 넣기">현위치</button><div class="picked" id="pk-from" hidden></div></div>
+        <div class="row"><label for="to">도착</label><input id="to" name="to" placeholder="주소나 장소 이름" enterkeyhint="go"><div class="picked" id="pk-to" hidden></div></div>
       </div>
       <button type="button" id="swap" aria-label="출발지와 도착지 바꾸기">⇅</button>
       <button type="submit" id="go">경로 비교</button>
     </div>
   </form>
+
+  <div id="sugg" class="sugg" hidden aria-live="polite"></div>
 
   <p id="status" role="status"></p>
 
@@ -210,7 +232,8 @@ function render(data) {
   $('headline').textContent = okList.length
     ? `가장 빠른 길은 ${bestNames.join(', ')}, ${fmtTime(minD)}`
     : '세 곳 모두 경로를 받지 못했어요';
-  $('places').innerHTML = `출발 ${esc(o.name)}<br>도착 ${esc(d.name)}`;
+  const af = picked.from ? ` (${esc(picked.from.addr)})` : '', ad = picked.to ? ` (${esc(picked.to.addr)})` : '';
+  $('places').innerHTML = `출발 ${esc(o.name)}${af}<br>도착 ${esc(d.name)}${ad}`;
 
   // 차선 막대
   $('lanes').innerHTML = SERVICES.map(s => {
@@ -253,13 +276,101 @@ function render(data) {
   $('out').hidden = false;
 }
 
+// ---------- 장소 검색 (후보 목록) ----------
+const searchCache = new Map();
+const picked = { from: null, to: null };   // 후보에서 확정한 장소 { name, addr, lat, lng }
+let suggFor = null, suggItems = [], suggTimer = 0, suggSeq = 0, pendingSubmit = false;
+
+async function searchPlaces(q) {
+  q = q.trim();
+  if (searchCache.has(q)) return searchCache.get(q);
+  let res;
+  try { res = await fetch(`${WORKER_URL}/search?q=${enc(q)}`); }
+  catch { throw new Error('Worker에 연결하지 못했어요. WORKER_URL과 ALLOWED_ORIGINS 설정을 확인하세요.'); }
+  const data = await res.json().catch(() => ({ error: `서버 응답을 읽을 수 없어요 (${res.status}).` }));
+  if (res.status === 404) throw new Error('Worker에 검색 기능이 없어요. 새 worker.js를 붙여넣고 Deploy하세요.');
+  if (!res.ok || data.error) throw new Error(data.error || `검색 실패 (${res.status})`);
+  const items = Array.isArray(data.items) ? data.items : [];
+  searchCache.set(q, items);
+  return items;
+}
+
+function candHtml(items, attr) {
+  return items.map((it, k) =>
+    `<button type="button" class="cand" ${attr}="${k}"><b>${esc(it.name)}</b>${it.cat ? `<span class="cat">${esc(it.cat)}</span>` : ''}<small>${esc(it.addr)}</small></button>`
+  ).join('');
+}
+
+function setPickedLine(id) {
+  const el = $('pk-' + id), p = picked[id];
+  el.textContent = p ? `✓ ${p.addr}` : '';
+  el.hidden = !p;
+}
+
+function hideSugg() {
+  clearTimeout(suggTimer); suggSeq++;
+  suggFor = null; suggItems = [];
+  $('sugg').hidden = true; $('sugg').innerHTML = '';
+}
+
+function showSugg(id, q, items) {
+  suggFor = id; suggItems = items;
+  const label = id === 'from' ? '출발지' : '도착지';
+  $('sugg').hidden = false;
+  $('sugg').innerHTML = items.length
+    ? `<p class="sugg-title">${label} 후보, '${esc(q)}' 검색 결과 ${items.length}곳. 맞는 곳을 누르세요.</p>${candHtml(items, 'data-k')}`
+    : `<p class="sugg-title">'${esc(q)}' 검색 결과가 없어요. 주소를 더 자세히 입력해 보세요.</p>`;
+}
+
+function choose(id, item) {
+  picked[id] = item;
+  $(id).value = item.name;
+  setPickedLine(id); hideSugg(); markActive(); setStatus('');
+  if (pendingSubmit) { pendingSubmit = false; $('f').requestSubmit(); }
+}
+
+async function resolveField(id) {
+  if (picked[id]) return picked[id];
+  const q = $(id).value.trim();
+  const items = await searchPlaces(q);
+  if (!items.length) throw new Error(`'${q}' 위치를 찾지 못했어요. 주소를 더 자세히 입력해 보세요.`);
+  if (items.length === 1) { picked[id] = items[0]; setPickedLine(id); return items[0]; }
+  showSugg(id, q, items);
+  pendingSubmit = true;
+  return null;
+}
+
+$('sugg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-k]');
+  if (!b || !suggFor) return;
+  const item = suggItems[Number(b.dataset.k)];
+  if (item) choose(suggFor, item);
+});
+
+['from', 'to'].forEach(id => $(id).addEventListener('input', () => {
+  picked[id] = null; setPickedLine(id); pendingSubmit = false; markActive();
+  clearTimeout(suggTimer);
+  const q = $(id).value.trim();
+  if (q.length < 2) { suggSeq++; if (suggFor === id) hideSugg(); return; }
+  const seq = ++suggSeq;
+  suggTimer = setTimeout(async () => {
+    try {
+      const items = await searchPlaces(q);
+      if (seq !== suggSeq || $(id).value.trim() !== q) return;
+      showSugg(id, q, items);
+    } catch (err) {
+      if (seq === suggSeq) { hideSugg(); setStatus(err.message, true); }
+    }
+  }, 300);
+}));
+
 // ---------- 자주 가는 곳 (최대 5개) ----------
 // 모든 기기에 똑같이 고정하고 싶으면 아래 목록에 적어두세요.
-// 예: { name: '집', addr: '경기도 의정부시 ○○로 12' }
+// 예: { name: '집', addr: '경기도 의정부시 ○○로 12', lat: 37.7, lng: 127.0 }  (lat, lng는 생략 가능)
 const DEFAULT_PLACES = [];
 const FAV_KEY = 'navi-places', FAV_SLOTS = 5;
 let places = loadPlaces();
-let editing = -1;
+let editing = -1, editPick = null, favCandItems = [], favTimer = 0, favSeq = 0;
 
 function loadPlaces() {
   let list = null;
@@ -267,16 +378,20 @@ function loadPlaces() {
   if (!Array.isArray(list)) list = DEFAULT_PLACES;
   return Array.from({ length: FAV_SLOTS }, (_, i) => {
     const p = list[i];
-    return p && p.name && p.addr ? { name: String(p.name), addr: String(p.addr) } : null;
+    if (!(p && p.name && p.addr)) return null;
+    const out = { name: String(p.name), addr: String(p.addr) };
+    if (Number.isFinite(p.lat) && Number.isFinite(p.lng)) { out.lat = p.lat; out.lng = p.lng; }
+    return out;
   });
 }
 function savePlaces() { try { localStorage.setItem(FAV_KEY, JSON.stringify(places)); } catch {} }
+const hasPoint = p => !!p && Number.isFinite(p.lat) && Number.isFinite(p.lng);
 
 function markActive() {
-  const cur = { from: $('from').value.trim(), to: $('to').value.trim() };
   document.querySelectorAll('#favBody [data-act="from"], #favBody [data-act="to"]').forEach(b => {
-    const p = places[Number(b.dataset.i)];
-    b.classList.toggle('on', !!p && p.addr === cur[b.dataset.act]);
+    const id = b.dataset.act, p = places[Number(b.dataset.i)], pk = picked[id];
+    const on = !!p && (hasPoint(p) ? !!pk && pk.lat === p.lat && pk.lng === p.lng : !pk && p.addr === $(id).value.trim());
+    b.classList.toggle('on', on);
   });
 }
 
@@ -285,7 +400,9 @@ function renderFav() {
     if (editing === i) {
       return `<div class="fav-form">
         <input id="favName" placeholder="이름 (예: 집, 회사)" maxlength="20" value="${esc(p ? p.name : '')}" aria-label="장소 이름">
-        <input id="favAddr" placeholder="주소나 장소 이름" value="${esc(p ? p.addr : '')}" aria-label="주소">
+        <input id="favAddr" placeholder="주소나 장소 이름을 검색하세요" value="${esc(p ? p.addr : '')}" aria-label="주소">
+        <div id="favPicked" class="fav-picked">${editPick ? '✓ ' + esc(editPick.addr) : ''}</div>
+        <div id="favCands" class="fav-cands" hidden></div>
         <div class="btns">
           <button type="button" class="primary" data-act="save" data-i="${i}">저장</button>
           ${p ? `<button type="button" data-act="del" data-i="${i}">삭제</button>` : ''}
@@ -305,56 +422,152 @@ function renderFav() {
   if (editing >= 0) { const el = $('favName'); if (el) el.focus(); }
 }
 
-$('favBody').addEventListener('click', e => {
+function hideFavCands() {
+  favSeq++; favCandItems = [];
+  const el = $('favCands'); if (el) { el.hidden = true; el.innerHTML = ''; }
+}
+function showFavCands(items, q) {
+  const el = $('favCands'); if (!el) return;
+  favCandItems = items;
+  el.hidden = false;
+  el.innerHTML = items.length
+    ? `<p class="sugg-title">'${esc(q)}' 검색 결과 ${items.length}곳. 맞는 곳을 누르세요.</p>${candHtml(items, 'data-fk')}`
+    : `<p class="sugg-title">'${esc(q)}' 검색 결과가 없어요. 주소를 더 자세히 입력해 보세요.</p>`;
+}
+
+$('favBody').addEventListener('click', async e => {
+  const fk = e.target.closest('button[data-fk]');
+  if (fk) {
+    const it = favCandItems[Number(fk.dataset.fk)];
+    if (!it) return;
+    editPick = it;
+    $('favAddr').value = it.addr;
+    if (!$('favName').value.trim()) $('favName').value = it.name;
+    $('favPicked').textContent = '✓ ' + it.addr;
+    hideFavCands();
+    return;
+  }
   const b = e.target.closest('button[data-act]');
   if (!b) return;
   const i = Number(b.dataset.i), act = b.dataset.act, p = places[i];
   if (act === 'from' || act === 'to') {
     if (!p) return;
-    $(act).value = p.addr;
-    markActive();
+    hideSugg(); pendingSubmit = false;
+    if (hasPoint(p)) { picked[act] = { name: p.name, addr: p.addr, lat: p.lat, lng: p.lng }; $(act).value = p.name; }
+    else { picked[act] = null; $(act).value = p.addr; }
+    setPickedLine(act); markActive();
     setStatus(`${p.name}을(를) ${act === 'from' ? '출발지' : '도착지'}로 넣었어요.`);
   } else if (act === 'edit') {
-    editing = i; renderFav();
+    editing = i; editPick = hasPoint(p) ? { name: p.name, addr: p.addr, lat: p.lat, lng: p.lng } : null; favCandItems = [];
+    renderFav();
   } else if (act === 'cancel') {
-    editing = -1; renderFav();
+    editing = -1; editPick = null; renderFav();
   } else if (act === 'del') {
-    places[i] = null; savePlaces(); editing = -1; renderFav(); setStatus('');
+    places[i] = null; savePlaces(); editing = -1; editPick = null; renderFav(); setStatus('');
   } else if (act === 'save') {
     const name = $('favName').value.trim(), addr = $('favAddr').value.trim();
     if (!name || !addr) { setStatus('이름과 주소를 모두 입력하세요.', true); return; }
-    places[i] = { name, addr }; savePlaces(); editing = -1; renderFav(); setStatus('');
+    let pk = editPick;
+    if (!pk) {
+      b.disabled = true;
+      try {
+        const items = await searchPlaces(addr);
+        if (!items.length) { setStatus(`'${addr}' 위치를 찾지 못했어요. 주소를 더 자세히 입력해 보세요.`, true); return; }
+        if (items.length > 1) { showFavCands(items, addr); setStatus('후보가 여러 곳이에요. 맞는 곳을 골라주세요.'); return; }
+        pk = items[0];
+      } catch (err) { setStatus(err.message, true); return; }
+      finally { b.disabled = false; }
+    }
+    places[i] = { name, addr: pk.addr, lat: pk.lat, lng: pk.lng };
+    savePlaces(); editing = -1; editPick = null; renderFav(); setStatus('');
   }
 });
+
+$('favBody').addEventListener('input', e => {
+  if (e.target.id !== 'favAddr') return;
+  editPick = null; $('favPicked').textContent = '';
+  clearTimeout(favTimer);
+  const q = e.target.value.trim();
+  if (q.length < 2) { hideFavCands(); return; }
+  const seq = ++favSeq;
+  favTimer = setTimeout(async () => {
+    try {
+      const items = await searchPlaces(q);
+      if (seq !== favSeq || !$('favAddr') || $('favAddr').value.trim() !== q) return;
+      showFavCands(items, q);
+    } catch (err) { if (seq === favSeq) setStatus(err.message, true); }
+  }, 300);
+});
+
 $('favBody').addEventListener('keydown', e => {
   const form = e.target.closest && e.target.closest('.fav-form');
   if (e.key === 'Enter' && form) { e.preventDefault(); form.querySelector('[data-act="save"]').click(); }
 });
-['from', 'to'].forEach(id => $(id).addEventListener('input', markActive));
+
+$('locate').addEventListener('click', () => {
+  if (!navigator.geolocation || !window.isSecureContext) {
+    setStatus('이 브라우저에서는 현재 위치를 쓸 수 없어요. 주소를 직접 입력해 주세요.', true); return;
+  }
+  const btn = $('locate');
+  btn.disabled = true; pendingSubmit = false; hideSugg();
+  setStatus('현재 위치를 찾는 중…');
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const lat = pos.coords.latitude, lng = pos.coords.longitude;
+    let addr = `현재 위치 (${lat.toFixed(5)}, ${lng.toFixed(5)})`;
+    try {
+      const res = await fetch(`${WORKER_URL}/reverse?lat=${lat}&lng=${lng}`);
+      const data = await res.json();
+      if (res.ok && data.addr) addr = data.addr + (data.building ? ` (${data.building})` : '');
+    } catch {}
+    picked.from = { name: '현재 위치', addr, lat, lng, live: true };
+    $('from').value = '현재 위치';
+    setPickedLine('from'); markActive(); setStatus('');
+    btn.disabled = false;
+  }, err => {
+    btn.disabled = false;
+    setStatus(
+      err.code === 1 ? '위치 권한이 꺼져 있어요. 주소창 왼쪽 아이콘에서 위치를 허용한 뒤 다시 눌러주세요.'
+      : err.code === 3 ? '위치를 찾는 데 시간이 오래 걸려요. 다시 눌러주세요.'
+      : '현재 위치를 가져오지 못했어요. 주소를 직접 입력해 주세요.', true);
+  }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 });
+});
 
 $('swap').addEventListener('click', () => {
   const a = $('from').value; $('from').value = $('to').value; $('to').value = a;
-  markActive();
+  [picked.from, picked.to] = [picked.to, picked.from];
+  setPickedLine('from'); setPickedLine('to');
+  hideSugg(); pendingSubmit = false; markActive();
 });
 
 $('f').addEventListener('submit', async e => {
   e.preventDefault();
-  const from = $('from').value.trim(), to = $('to').value.trim();
-  if (!from || !to) { setStatus('출발지와 도착지를 모두 입력하세요.', true); return; }
+  const fromTxt = $('from').value.trim(), toTxt = $('to').value.trim();
+  if (!fromTxt || !toTxt) { setStatus('출발지와 도착지를 모두 입력하세요.', true); return; }
   if (WORKER_URL.includes('YOUR-')) { setStatus('index.html의 WORKER_URL을 배포한 Worker 주소로 바꿔주세요.', true); return; }
 
   $('go').disabled = true;
-  setStatus('티맵, 카카오맵, 네이버지도에 경로를 묻는 중…');
+  pendingSubmit = false;
   try {
+    setStatus('장소를 확인하는 중…');
+    const o = await resolveField('from');
+    if (!o) { setStatus('출발지 후보가 여러 곳이에요. 아래에서 맞는 곳을 골라주세요.'); $('sugg').scrollIntoView({ block: 'nearest' }); return; }
+    const d = await resolveField('to');
+    if (!d) { setStatus('도착지 후보가 여러 곳이에요. 아래에서 맞는 곳을 골라주세요.'); $('sugg').scrollIntoView({ block: 'nearest' }); return; }
+
+    setStatus('티맵, 카카오맵, 네이버지도에 경로를 묻는 중…');
+    const qs = new URLSearchParams({ fromLat: o.lat, fromLng: o.lng, fromName: o.name, toLat: d.lat, toLng: d.lng, toName: d.name });
     let res;
-    try { res = await fetch(`${WORKER_URL}/compare?from=${enc(from)}&to=${enc(to)}`); }
+    try { res = await fetch(`${WORKER_URL}/compare?${qs}`); }
     catch { throw new Error('Worker에 연결하지 못했어요. WORKER_URL과 ALLOWED_ORIGINS 설정을 확인하세요.'); }
     const data = await res.json().catch(() => ({ error: `서버 응답을 읽을 수 없어요 (${res.status}).` }));
     if (!res.ok || data.error) throw new Error(data.error || `요청 실패 (${res.status})`);
     render(data);
     setStatus('');
-    try { localStorage.setItem('navi-last', JSON.stringify({ from, to })); } catch {}
-    history.replaceState(null, '', `?from=${enc(from)}&to=${enc(to)}`);
+    const live = !!(o.live || d.live);   // 현재 위치는 저장하거나 공유 링크에 담지 않는다
+    try { localStorage.setItem('navi-last', JSON.stringify({ from: o.live ? null : o, to: d.live ? null : d })); } catch {}
+    history.replaceState(null, '', live ? location.pathname : '?' + new URLSearchParams({
+      from: o.name, to: d.name, fc: `${o.lat},${o.lng}`, tc: `${d.lat},${d.lng}`, fa: o.addr, ta: d.addr,
+    }));
   } catch (err) {
     setStatus(err.message || '요청에 실패했어요.', true);
   } finally {
@@ -366,13 +579,27 @@ $('f').addEventListener('submit', async e => {
 (() => {
   const p = new URLSearchParams(location.search);
   if (p.get('from') && p.get('to')) {
-    $('from').value = p.get('from'); $('to').value = p.get('to');
+    for (const [id, c, a] of [['from', 'fc', 'fa'], ['to', 'tc', 'ta']]) {
+      $(id).value = p.get(id);
+      const m = (p.get(c) || '').split(',');
+      if (m.length === 2) {
+        const lat = Number(m[0]), lng = Number(m[1]);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) picked[id] = { name: p.get(id), addr: p.get(a) || p.get(id), lat, lng };
+      }
+      setPickedLine(id);
+    }
     $('f').requestSubmit();
     return;
   }
   try {
     const last = JSON.parse(localStorage.getItem('navi-last') || 'null');
-    if (last) { $('from').value = last.from; $('to').value = last.to; }
+    if (last) for (const id of ['from', 'to']) {
+      const v = last[id];
+      if (v && typeof v === 'object' && Number.isFinite(v.lat) && Number.isFinite(v.lng)) {
+        $(id).value = String(v.name || ''); picked[id] = { name: String(v.name || ''), addr: String(v.addr || v.name || ''), lat: v.lat, lng: v.lng };
+      } else if (typeof v === 'string') $(id).value = v;
+      setPickedLine(id);
+    }
   } catch {}
 })();
 renderFav();
